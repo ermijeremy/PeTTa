@@ -41,6 +41,30 @@ maybe_print_compiled_clause(Label, FormTerm, Clause) :-
     portray_clause(current_output, Clause),
     format("\e[33m^^^^^^^^^^^^^^^^^^^^^~n\e[0m").
 
+% Registered callable arity for a function symbol, excluding operator predicates
+% that would otherwise produce false positives for unary/binary infix ops.
+known_callable_arity(Fun, Arity) :-
+    ( current_predicate(Fun/Arity)
+    ; catch(arity(Fun, Arity), _, fail)
+    ),
+    \+ ( current_op(_, _, Fun), Arity =< 2 ).
+
+function_has_known_arity(Fun) :-
+    known_callable_arity(Fun, _).
+
+surface_arity(InternalArity, SurfaceArity) :-
+    SurfaceArity is InternalArity - 1.
+
+throw_wrong_argument_count(Fun, GotSurfaceArity) :-
+    findall(SurfaceArity,
+            ( known_callable_arity(Fun, InternalArity),
+              surface_arity(InternalArity, SurfaceArity)
+            ),
+            SurfaceArities0),
+    sort(SurfaceArities0, SurfaceArities),
+    throw(error(wrong_argument_count(Fun, SurfaceArities, GotSurfaceArity),
+                context(function_call, Fun))).
+
 %Conjunction builder, turning goals list to a flat conjunction:
 goals_list_to_conj([], true)      :- !.
 goals_list_to_conj([G], G)        :- !.
@@ -51,11 +75,13 @@ reduce([F|Args], Out) :- nonvar(F), atom(F), fun(F)
                          -> % --- Case 1: callable predicate ---
                             length(Args, N),
                             Arity is N + 1,
-                            ( current_predicate(F/Arity) , \+ (current_op(_, _, F), Arity =< 2)
+                            ( known_callable_arity(F, Arity)
                               -> append(Args,[Out],CallArgs),
                                  Goal =.. [F|CallArgs],
                                  catch(call(Goal),_,fail)
-                               ; Out = partial(F,Args) )
+                               ; function_has_known_arity(F)
+                                 -> throw_wrong_argument_count(F, N)
+                                ; Out = partial(F,Args) )
                           ; % --- Case 2: partial closure ---
                             compound(F), F = partial(Base, Bound) -> append(Bound, Args, NewArgs),
                                                                      reduce([Base|NewArgs], Out)
@@ -327,13 +353,14 @@ build_call_or_partial(Fun, AVs, Out, Inner, Extra, Goals) :- length(AVs, N),
                                                              Arity is N + 1,
                                                              ( maybe_specialize_call(Fun, AVs, Out, Goal)
                                                                -> append(Inner, [Goal|Extra], Goals)
-                                                                ; ( ( current_predicate(Fun/Arity) ; catch(arity(Fun, Arity), _, fail) ),
-                                                                     \+ ( current_op(_, _, Fun), Arity =< 2 ) )
+                                                                ; known_callable_arity(Fun, Arity)
                                                                   -> append(AVs, [Out], Args),
                                                                      Goal =.. [Fun|Args],
                                                                      append(Inner, [Goal|Extra], Goals)
-                                                                   ; Out = partial(Fun, AVs),
-                                                                     append(Inner, Extra, Goals) ).
+                                                                   ; function_has_known_arity(Fun)
+                                                                     -> throw_wrong_argument_count(Fun, N)
+                                                                    ; Out = partial(Fun, AVs),
+                                                                      append(Inner, Extra, Goals) ).
 
 %Type function call generation, returns function call plus typechecks for input and output:
 typed_functioncall_branch(Fun, TypeChain, T, GsH, IsPartial, Bound, Out, BranchGoal) :-
